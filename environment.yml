@@ -1,0 +1,24 @@
+name: chai-1
+channels:
+  - conda-forge
+  - defaults
+  - nvidia
+  - pytorch
+dependencies:
+  - python=3.10
+  - pip
+  - cudatoolkit=11.8
+  - numpy
+  - pandas
+  - scipy
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pip:
+      - chai_lab==0.6.0
+      - git+https://github.com/chaidiscovery/chai-lab.git
+      - matplotlib
+      - biopython
+      - tqdm
+      - requests
+      - transformers

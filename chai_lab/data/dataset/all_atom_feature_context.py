@@ -93,3 +93,16 @@ class AllAtomFeatureContext:
             **(self.embedding_context.to_dict() if self.embedding_context else {}),
             **self.restraint_context.to_dict(),
         }
+        
+    def get_features(self, feature_name: str) -> Any:
+        """Get features by name from the feature context or its components."""
+        # First check if it's directly in the context
+        if hasattr(self, feature_name):
+            return getattr(self, feature_name)
+        
+        # Then check in structure context
+        if hasattr(self.structure_context, feature_name):
+            return getattr(self.structure_context, feature_name)
+            
+        # Check in other contexts as needed
+        return None

@@ -100,6 +100,7 @@ from chai_lab.data.parsing.restraints import parse_pairwise_table
 from chai_lab.data.parsing.structure.entity_type import EntityType
 from chai_lab.model.diffusion_schedules import InferenceNoiseSchedule
 from chai_lab.model.utils import center_random_augmentation
+from chai_lab.model.allosteric_head import AllostericHead, build_protein_graph
 from chai_lab.ranking.frames import get_frames_and_mask
 from chai_lab.ranking.rank import SampleRanking, get_scores, rank
 from chai_lab.utils.paths import chai1_component
@@ -287,6 +288,8 @@ class StructureCandidates:
     pde: Float[Tensor, "candidate num_tokens num_tokens"]
     # Predicted local distance difference test (pLDDT)
     plddt: Float[Tensor, "candidate num_tokens"]
+    # Predicted allosteric site scores (0 to 1 probability per residue)
+    allosteric_scores: Float[Tensor, "candidate num_tokens"] = None
 
     def __post_init__(self):
         assert len(self.cif_paths) == len(self.ranking_data) == self.pae.shape[0]
@@ -295,9 +298,16 @@ class StructureCandidates:
         """Sort by aggregate score from most to least confident."""
         agg_scores = torch.concatenate([rd.aggregate_score for rd in self.ranking_data])
         idx = torch.argsort(agg_scores, descending=True)  # Higher scores are better
+        
+        # Include allosteric scores if they exist
+        allosteric_scores_sorted = None
+        if self.allosteric_scores is not None:
+            allosteric_scores_sorted = self.allosteric_scores[idx]
+            
         return StructureCandidates(
             cif_paths=[self.cif_paths[i] for i in idx],
             ranking_data=[self.ranking_data[i] for i in idx],
+            allosteric_scores=allosteric_scores_sorted,
             msa_coverage_plot_path=self.msa_coverage_plot_path,
             pae=self.pae[idx],
             pde=self.pde[idx],
@@ -308,6 +318,14 @@ class StructureCandidates:
     def concat(
         cls, candidates: Sequence["StructureCandidates"]
     ) -> "StructureCandidates":
+        # Check if all candidates have allosteric scores
+        all_have_allosteric = all(c.allosteric_scores is not None for c in candidates)
+        
+        # Concatenate allosteric scores if all candidates have them
+        allosteric_scores = None
+        if all_have_allosteric:
+            allosteric_scores = torch.cat([c.allosteric_scores for c in candidates])
+        
         return cls(
             cif_paths=list(
                 itertools.chain.from_iterable([c.cif_paths for c in candidates])
@@ -319,6 +337,7 @@ class StructureCandidates:
             pae=torch.cat([c.pae for c in candidates]),
             pde=torch.cat([c.pde for c in candidates]),
             plddt=torch.cat([c.plddt for c in candidates]),
+            allosteric_scores=allosteric_scores,
         )
 
 
@@ -500,6 +519,8 @@ def run_inference(
     seed: int | None = None,
     device: str | None = None,
     low_memory: bool = True,
+    # Allosteric site prediction
+    predict_allosteric_sites: bool = False,
 ) -> StructureCandidates:
     assert num_trunk_samples > 0 and num_diffn_samples > 0
     if output_dir.exists():
@@ -539,6 +560,7 @@ def run_inference(
             seed=seed + trunk_idx if seed is not None else None,
             device=torch_device,
             low_memory=low_memory,
+            predict_allosteric=predict_allosteric_sites,
         )
         all_candidates.append(cand)
     return StructureCandidates.concat(all_candidates)
@@ -562,6 +584,8 @@ def run_folding_on_context(
     seed: int | None = None,
     device: torch.device | None = None,
     low_memory: bool,
+    # allosteric site prediction
+    predict_allosteric: bool = False,
 ) -> StructureCandidates:
     """
     Function for in-depth explorations.
@@ -999,6 +1023,250 @@ def run_folding_on_context(
 
         np.savez(scores_out_path, **get_scores(ranking_outputs))
 
+    # Calculate allosteric scores if requested
+    allosteric_scores = None
+    if predict_allosteric:
+        logging.info("Predicting allosteric binding sites...")
+        # Initialize allosteric prediction head with 3D spatial features
+        allosteric_head = AllostericHead(
+            node_features=25,  # 21 residue types + 1 position encoding + 3 coordinates
+            hidden_dim=64,
+            edge_features=4,   # Distance + 3D direction vector
+            num_layers=3,
+            dropout=0.2
+        ).to(device)
+        
+        # Calculate allosteric scores for each model
+        all_allosteric_scores = []
+        for i in range(num_diffn_samples):
+            # Extract coordinates for CA atoms
+            # Get atom names from the structure context
+            atom_names = feature_context.structure_context.atom_ref_name
+            ca_indices = []
+
+            # Find CA atoms for each residue
+            # Use token_exists_mask to determine the number of residues/tokens
+            num_residues = token_single_mask.sum().item()
+            print(f"Number of residues/tokens in structure: {num_residues}")
+            
+            # Based on the printed shapes, we need to handle the batch dimension correctly
+            # atom_token_indices: [1, 17664] - has batch dimension
+            # atom_within_token_index: [1, 17664] - has batch dimension
+            # atom_pos: [2, 17664, 3] - has sample and batch dimensions
+            
+            # Extract the first batch for our processing
+            atom_token_indices_batch0 = atom_token_indices[0]
+            atom_within_token_index_batch0 = atom_within_token_index[0]
+            
+            # Debug atom names
+            ca_atom_count = sum(1 for name in atom_names if name == 'CA')
+            print(f"Found {ca_atom_count} atoms named 'CA' out of {len(atom_names)} total atoms")
+            
+            # Simple approach: just find CA atoms using their name
+            ca_indices = []
+            atom_to_residue_map = {}  # Map atom indices to their corresponding residue indices
+            
+            # Filter by atom name
+            for atom_idx in range(len(atom_names)):
+                # Get the corresponding token/residue
+                res_idx = atom_token_indices_batch0[atom_idx].item()
+                
+                # Store mapping
+                atom_to_residue_map[atom_idx] = res_idx
+                
+                # Only consider atoms belonging to residues within our count
+                if res_idx < num_residues:
+                    # Check if this is a CA atom
+                    if atom_names[atom_idx] == 'CA':
+                        ca_indices.append(atom_idx)
+                        print(f"Added CA atom {atom_idx} for residue {res_idx}")
+            
+            # If we don't find any CA atoms by name, try to find them by position
+            if not ca_indices and atom_within_token_index_batch0 is not None:
+                print("No CA atoms found by name, trying to find by position...")
+                for atom_idx in range(len(atom_within_token_index_batch0)):
+                    # CA atoms typically have within_token_index = 1
+                    if atom_within_token_index_batch0[atom_idx].item() == 1:
+                        res_idx = atom_token_indices_batch0[atom_idx].item()
+                        if res_idx < num_residues:
+                            ca_indices.append(atom_idx)
+            
+            # Convert to tensor and get positions
+            if ca_indices:
+                # For A100 GPU, we want to keep as much work on the GPU as possible
+                # Move the indices to GPU first, then do the indexing on GPU
+                atom_pos_device = atom_pos.device  # This should be CUDA for A100
+                
+                # Convert indices to tensor on GPU
+                ca_indices = torch.tensor(ca_indices, device=atom_pos_device)
+                ca_positions = atom_pos[i, ca_indices]
+                print(f"Found {len(ca_indices)} CA atoms on {atom_pos_device}")
+            else:
+                print("WARNING: No CA atoms found in the structure!")
+                # Create minimal placeholder with correct shape
+                ca_indices = torch.zeros(1, dtype=torch.long, device=atom_pos.device)
+                ca_positions = torch.zeros((1, 3), device=atom_pos.device)
+
+            
+            # Get residue types - mask to get only valid residues
+            # Extract only the residues that correspond to our CA atoms
+            # token_residue_type has shape [num_tokens] with values 0-20 for residue types
+            if ca_indices.numel() > 0:
+                # For A100 GPU, we aim to keep everything on the GPU for best performance
+                
+                # First, move all necessary tensors to GPU
+                atom_pos_device = atom_pos.device  # Should be CUDA for A100
+                
+                # Create residue-to-CA atom mapping
+                residue_to_ca = {}
+                for idx in ca_indices:
+                    idx_val = idx.item() if isinstance(idx, torch.Tensor) else idx
+                    residue = atom_to_residue_map.get(idx_val)
+                    if residue is not None:
+                        residue_to_ca[residue] = idx_val
+                
+                # Count unique residues
+                unique_residue_count = len(set(atom_to_residue_map.values()))
+                ca_residue_count = len(residue_to_ca)
+                print(f"Found {ca_residue_count} residues with CA atoms out of {unique_residue_count} unique residues")
+                
+                # Create a list of unique residue indices that have CA atoms
+                residue_indices = sorted(residue_to_ca.keys())
+                
+                # Convert to tensor and move to device
+                token_indices = torch.tensor(residue_indices, device=atom_pos_device)
+                
+                # Move token_residue_type to GPU if needed
+                token_residue_type_gpu = feature_context.structure_context.token_residue_type.to(atom_pos_device)
+                
+                # Get residue types for these indices
+                residue_types = token_residue_type_gpu[token_indices]
+                
+                print(f"Residue types tensor shape: {residue_types.shape}, data type: {residue_types.dtype}")
+                
+                # Everything should be on the GPU already, but let's verify
+                ca_positions_device = ca_positions.device
+                
+                # Build protein graph with 3D spatial features - use only the CA positions we found
+                print(f"Building protein graph with {ca_positions.shape[0]} CA atoms on {ca_positions_device}")
+                node_features, edge_index, edge_features = build_protein_graph(
+                    ca_positions, residue_types, distance_threshold=10.0)
+            else:
+                # Create minimal empty graph as fallback
+                print("WARNING: Creating empty graph as no CA atoms were found")
+                residue_types = torch.zeros(1, dtype=torch.long, device=device)
+                node_features = torch.zeros((1, 25), device=device)  # 21 residue types + 1 position + 3 coords
+                edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
+                edge_features = torch.zeros((1, 4), device=device)  # distance + 3D direction vector
+            
+            # Run allosteric prediction
+            with torch.no_grad():
+                # For the A100 GPU, keep everything on the GPU
+                # Move the allosteric head to the GPU device that our tensors are on
+                gpu_device = atom_pos.device  # This should be the A100 GPU
+                
+                # Move the allosteric head to GPU
+                allosteric_head = allosteric_head.to(gpu_device)
+                
+                # Check if we have valid CA positions
+                if ca_positions.shape[0] == 0:
+                    print("WARNING: No valid CA positions for allosteric prediction.")
+                    print(f"Creating placeholder allosteric score matching plddt shape: {plddt_scores[i].shape}")
+                    # Skip GNN and create a properly shaped tensor directly
+                    placeholder_score = torch.zeros_like(plddt_scores[i])
+                    all_allosteric_scores.append(placeholder_score)
+                    continue
+                
+                # Move inputs to GPU if needed
+                node_features_gpu = node_features.to(gpu_device)
+                edge_index_gpu = edge_index.to(gpu_device)
+                plddt_gpu = plddt_scores[i].to(gpu_device)
+                pae_gpu = pae_scores[i].to(gpu_device)
+                
+                # Run on GPU
+                print(f"Running allosteric prediction on {gpu_device}")
+                
+                # Check if the number of nodes in our graph matches the number of tokens
+                # in the structure (it might not if we didn't find CA atoms for all residues)
+                num_nodes = node_features_gpu.shape[0]
+                num_tokens = plddt_gpu.shape[0]
+                print(f"Graph has {num_nodes} nodes, structure has {num_tokens} tokens")
+                
+                if num_nodes == num_tokens:
+                    # Normal case - graph nodes correspond 1:1 with structure tokens
+                    allosteric_score = allosteric_head(
+                        node_features=node_features_gpu,
+                        edge_index=edge_index_gpu,
+                        plddt=plddt_gpu,
+                        edge_attr=edge_features.to(gpu_device),
+                        pae=pae_gpu
+                    )
+                else:
+                    print("WARNING: Number of graph nodes doesn't match number of structure tokens")
+                    print("Running allosteric prediction on available nodes")
+                    
+                    # Run prediction on available nodes
+                    if num_nodes > 0:
+                        # For pLDDT and PAE, we need to filter to just the nodes we have
+                        if token_indices is not None and token_indices.shape[0] == num_nodes:
+                            # Get indices of structure tokens corresponding to our graph nodes
+                            token_idx_cpu = token_indices.cpu()
+                            
+                            # Filter pLDDT to just these tokens
+                            filtered_plddt = plddt_gpu[token_idx_cpu]
+                            
+                            # For PAE, extract the submatrix corresponding to these tokens
+                            mesh_x, mesh_y = torch.meshgrid(token_idx_cpu, token_idx_cpu, indexing='ij')
+                            filtered_pae = pae_gpu[mesh_x, mesh_y]
+                            
+                            # Run prediction with 3D edge features
+                            partial_score = allosteric_head(
+                                node_features=node_features_gpu,
+                                edge_index=edge_index_gpu,
+                                plddt=filtered_plddt,
+                                edge_attr=edge_features.to(gpu_device),
+                                pae=filtered_pae
+                            )
+                            
+                            # Map partial scores back to full structure
+                            allosteric_score = torch.zeros(num_tokens, device=gpu_device)
+                            allosteric_score[token_idx_cpu] = partial_score
+                        else:
+                            # If we can't map properly, just use zeros
+                            print("WARNING: Cannot map nodes to tokens. Creating placeholder scores.")
+                            allosteric_score = torch.zeros(num_tokens, device=gpu_device)
+                    else:
+                        # Create empty placeholder
+                        allosteric_score = torch.zeros(num_tokens, device=gpu_device)
+            
+            all_allosteric_scores.append(allosteric_score)
+        
+        # Stack scores into tensor [num_diffn_samples, num_residues]
+        # Check if we have valid scores with correct dimensions
+        if all_allosteric_scores and all(s.numel() > 0 for s in all_allosteric_scores):
+            allosteric_scores = torch.stack(all_allosteric_scores)
+            print(f"Stacked allosteric scores shape: {allosteric_scores.shape}")
+        else:
+            # Create a properly shaped tensor filled with zeros
+            # The expected shape is [num_samples, num_tokens]
+            num_tokens = plddt_scores.shape[1]  # Get correct token count from plddt scores
+            print(f"Creating placeholder allosteric scores with shape: [{num_diffn_samples}, {num_tokens}]")
+            allosteric_scores = torch.zeros(
+                (num_diffn_samples, num_tokens), 
+                device=plddt_scores.device
+            )
+        
+        # Save allosteric scores to NPZ files
+        for i, cif_path in enumerate(cif_paths):
+            score_dir = cif_path.parent
+            score_file = score_dir / f"allosteric_scores.model_idx_{i}.npz"
+            np.savez(
+                score_file,
+                allosteric_scores=allosteric_scores[i].cpu().numpy(),
+            )
+        
+        logging.info(f"Allosteric binding site prediction completed for {num_diffn_samples} models")
+    
     return StructureCandidates(
         cif_paths=cif_paths,
         ranking_data=ranking_data,
@@ -1006,4 +1274,5 @@ def run_folding_on_context(
         pae=pae_scores,
         pde=pde_scores,
         plddt=plddt_scores,
+        allosteric_scores=allosteric_scores,
     )
